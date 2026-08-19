@@ -1,59 +1,82 @@
 # Tiny GPT
 
-A decoder-only transformer language model built **from scratch in PyTorch** — no
-modeling library, no `transformers` import. Every piece (byte-level BPE
-tokenizer, sinusoidal positional encodings, multi-head causal self-attention,
-pre-norm transformer blocks, weight-tied output projection, and an
-autoregressive sampler with temperature / top-k / nucleus decoding) is wired up
-by hand.
+This is a small GPT style language model that I wrote from scratch in PyTorch. The
+tokenizer, the positional encodings, the causal attention mask, the training loop and
+the sampler are all written by hand. The only thing I lean on is PyTorch itself.
 
-The model is trained on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories),
-a corpus of short, simple children's stories, which makes it possible to train a
-genuinely coherent language model on a laptop (Apple Silicon / MPS) in well under
-an hour.
+I trained it on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories),
+a corpus of very short children's stories written with a simple vocabulary. The
+stories are simple enough that a model this small can actually learn to write
+coherent English, and the whole training run finishes in well under an hour on a
+laptop with Apple Silicon.
 
-The largest configuration (~7.1M parameters) reaches a **validation perplexity of
-8.08** and generates multi-sentence stories with consistent characters and
-setting.
-
----
+The biggest version has about 7.1 million parameters and reaches a validation
+perplexity of 8.08. It writes short stories that keep the same characters and setting
+going for several sentences.
 
 ## Architecture
 
-```
-token IDs  (batch, seq)
-    │
-    ├─ token embedding                (vocab=3000 → d_model)   ·  ×√d_model
-    ├─ + sinusoidal positional encoding
-    │
-    ├─ ┌─────────────────────────────────────────────┐
-    │  │  LayerNorm → Multi-Head Causal Self-Attn → + │
-    │  │  LayerNorm → Feed-Forward (GELU)         → + │   × N layers
-    │  └─────────────────────────────────────────────┘
-    │
-    ├─ final LayerNorm
-    ├─ output projection              (weight-tied with token embedding)
-    │
-    └─ logits  (batch, seq, vocab=3000)
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+    <img src="assets/architecture-light.svg" alt="Tiny GPT decoder-only transformer architecture" width="320">
+  </picture>
+</p>
 
-Design choices:
+## How I built it
 
-- **Byte-level BPE tokenizer** (`tokenizers` library), vocab **3,000**, byte-complete
-  so any UTF-8 string is representable; `<unk>` and `<eos>` are the only special tokens.
-- **Sinusoidal positional encodings** — fixed sine/cosine waves, zero extra parameters.
-- **Pre-norm blocks** (LayerNorm *before* each sub-layer) for stable training.
-- **Multi-head causal self-attention** with a head dimension of 32; an explicit
-  additive mask built with `-1e9` (not `-inf`) to sidestep an MPS NaN edge case.
-- **Weight tying**: the output projection shares the token-embedding matrix, which
-  removes a `vocab × d_model` parameter block and aligns the input/output spaces.
-- **AdamW** (β = 0.9, 0.95), weight decay 0.1, **linear warmup → cosine decay** LR
-  schedule, and **gradient-norm clipping** at 1.0.
+### 1. A byte level BPE tokenizer
 
-### Model sizes
+I trained a byte level BPE tokenizer on the TinyStories text with a vocabulary of
+3,000 tokens. Byte level means every raw byte gets mapped to a visible character
+before the merges run, so any UTF-8 string can be encoded. There are two special
+tokens, `<unk>` for anything unseen and `<eos>` to mark the end of a story. A small
+vocabulary keeps the embedding table cheap, which matters a lot when the whole model
+is only a few million parameters.
 
-All three sizes share `vocab=3000`, `context=256`, `dropout=0.1`, and a head
-dimension of 32; they differ only in width and depth.
+### 2. A token stream to train on
+
+The TinyStories files separate stories with `<|endoftext|>`, so I split on that,
+tokenize all the stories in one batch, and glue the token IDs together into one long
+stream with an `<eos>` between stories. The dataset then hands out overlapping windows
+of 257 tokens. The first 256 are the input and the same window shifted by one position
+is the target, which is the standard next token objective.
+
+### 3. The model
+
+Token IDs go into an embedding table, get scaled by the square root of the model
+dimension, and then have sinusoidal positional encodings added on top. The positional
+signal is a fixed pattern of sine and cosine waves, so it costs zero parameters and
+generalizes cleanly across positions.
+
+From there the signal passes through five identical transformer blocks. Each block is
+pre-norm, so a LayerNorm runs before each sublayer and a residual connection wraps
+around it. The first sublayer is multi head causal self attention with a head
+dimension of 32. The second is a two layer feed forward network with a GELU in the
+middle. After the last block there is a final LayerNorm and then an output projection
+back to vocabulary size.
+
+The output projection shares its weight matrix with the token embedding table. That
+saves a full `vocab x d_model` block of parameters and keeps the input and output
+spaces aligned.
+
+### 4. The training loop
+
+I use AdamW with betas of 0.9 and 0.95, weight decay 0.1, and a base learning rate of
+3e-4. The learning rate warms up linearly over the first 300 steps and then follows a
+cosine decay down to 10 percent of the base value. Gradient norms are clipped at 1.0.
+Every 500 steps the loop measures validation loss and saves a checkpoint whenever the
+loss improves.
+
+One useful sanity check is the very first loss value. With a vocabulary of 3,000 a
+model that has learned nothing should sit around `ln(3000) = 8.006`, and that is
+roughly where the first logged loss lands.
+
+### 5. Three model sizes
+
+I trained three configurations under identical settings so the only thing changing is
+capacity. All three share a vocabulary of 3,000, a context length of 256, dropout of
+0.1, and a head dimension of 32. They differ in width and depth only.
 
 | Model  | d_model | heads | layers | d_ff | Parameters |
 |--------|:-------:|:-----:|:------:|:----:|:----------:|
@@ -61,45 +84,50 @@ dimension of 32; they differ only in width and depth.
 | medium |   256   |   8   |   5    | 512  |  3,404,032 |
 | large  |   384   |  12   |   5    | 768  |  7,072,128 |
 
----
+### 6. Sampling
+
+Generation is a plain autoregressive loop. The model sees the last 256 tokens, I take
+the logits at the final position, divide them by the temperature, optionally filter
+them with top-k or nucleus sampling, turn them into probabilities, and draw one token.
+That token gets appended and the loop runs again until it hits `<eos>` or the token
+budget.
 
 ## Results
 
-Each model trained for 5,000 steps (batch size 64, context length 256) on the
-TinyStories corpus. Validation is on the held-out split.
+Each model ran for 5,000 steps with a batch size of 64 and a context length of 256.
+Validation numbers come from the held out split.
 
 | Model  | Parameters | Final val loss | Perplexity |
 |--------|:----------:|:--------------:|:----------:|
 | small  |  1,046,656 |     2.8764     |   17.75    |
 | medium |  3,404,032 |     2.3249     |   10.23    |
-| **large** | **7,072,128** | **2.0889** | **8.08** |
+| large  |  7,072,128 |     2.0889     |    8.08    |
 
-The scaling gap is clean: the large model is more than twice as certain about the
-next token as the small one, and the improvement is qualitative as well as
-quantitative — it maintains a consistent setting and cast of characters across
-several sentences without the repetition loops the smaller models fall into. (For
-reference, the random-prediction loss is `ln(3000) ≈ 8.006`.)
+The scaling story is clean. The large model is more than twice as certain about the
+next token as the small one, and the difference shows up in the text as well as in the
+numbers. It holds a setting and a cast of characters together across several sentences,
+while the smaller models drift into repetition loops after a sentence or two.
 
-### Sample generations (large model)
+### A sample from the large model
 
-> **Once upon a time,** in an ancient tree. In this forest lived many friends,
-> like birds and the other bugs... The squirrels were all playing in a tree and
-> were very careful not the birds that were not like birds, and they all lived
-> together in a small village with a kind girl named Amy and the squirrels,
-> always together and sharing.
+> Once upon a time, in an ancient tree. In this forest lived many friends, like birds
+> and the other bugs... The squirrels were all playing in a tree and were very careful
+> not the birds that were not like birds, and they all lived together in a small
+> village with a kind girl named Amy and the squirrels, always together and sharing.
 
-### Temperature sweep (same prompt, medium model)
+### Temperature sweep, same prompt, medium model
 
-- **T = 0.5** — most coherent, reads like a real children's story, but repeats phrases.
-- **T = 0.8–1.0** — the sweet spot: readable stories with reasonable variety.
-- **T = 1.2** — more creative (invents a frog named Fin), but grammar and logic slip.
-
----
+- T = 0.5 gives the most coherent text. It reads like a real children's story and it
+  repeats phrases often.
+- T = 0.8 to 1.0 is the sweet spot. Readable stories with a reasonable amount of
+  variety.
+- T = 1.2 gets more creative, inventing things like a frog named Fin, and the grammar
+  and logic start to slip.
 
 ## Usage
 
 ```bash
-pip install -r requirements.txt
+pip install torch tokenizers
 
 # 0. Download the TinyStories text files into ./data
 #    (TinyStoriesV2-GPT4-train.txt, TinyStoriesV2-GPT4-valid.txt)
@@ -124,16 +152,18 @@ python -m src.generate --checkpoint tinylm_checkpoint.pt \
 
 ```
 src/
-  tokenizer.py   Byte-level BPE training (vocab 3,000, <unk>/<eos>)
-  data.py        Story splitting, tokenization, and the token-stream Dataset
-  model.py       SinusoidalPositionalEncoding, TransformerBlock, TinyLM + sizes
-  train.py       AdamW + warmup/cosine schedule, grad clipping, eval, checkpoints
-  generate.py    Autoregressive sampling (temperature / top-k / nucleus)
+  tokenizer.py   Byte level BPE training (vocab 3,000, <unk>/<eos>)
+  data.py        Story splitting, tokenization, and the token stream Dataset
+  model.py       SinusoidalPositionalEncoding, TransformerBlock, TinyLM and sizes
+  train.py       AdamW with warmup and cosine decay, grad clipping, eval, checkpoints
+  generate.py    Autoregressive sampling (temperature, top-k, nucleus)
 ```
 
-## Notes
+## Notes on Apple Silicon
 
-Trains comfortably on a single Apple Silicon GPU via PyTorch MPS (also runs on
-CUDA or CPU). The masking and positional-encoding code deliberately avoids the
-`is_causal` fast path because it can produce NaNs on MPS; passing an explicit
-additive mask is numerically stable and just as correct.
+Everything trains comfortably on a single Apple Silicon GPU through PyTorch MPS, and
+it also runs on CUDA or CPU. Two small details make the MPS path stable. I build the
+causal mask myself and pass it in as an explicit additive mask, since the `is_causal`
+fast path can produce NaNs there. And I fill the masked positions with `-1e9`, which
+behaves better than negative infinity on that backend while still driving those
+attention weights to zero.
